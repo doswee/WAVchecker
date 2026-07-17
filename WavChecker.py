@@ -3,6 +3,7 @@ import sys
 import csv
 import shutil
 import subprocess
+import wave
 from tinytag import TinyTag
 
 from PySide6.QtWidgets import (
@@ -98,12 +99,13 @@ class AnalysisWorker(QRunnable):
         self.signals.analysis_finished.emit()
 
 class ConversionWorker(QRunnable):
-    def __init__(self, row, input_path, target_sr, target_bd, out_dir, stop_func):
+    def __init__(self, row, input_path, target_sr, target_bd, original_data, out_dir, stop_func):
         super().__init__()
         self.row = row
         self.input_path = input_path
         self.target_sr = target_sr
         self.target_bd = target_bd
+        self.original_data = original_data
         self.out_dir = out_dir
         self.stop_func = stop_func
         self.signals = WorkerSignals()
@@ -116,56 +118,102 @@ class ConversionWorker(QRunnable):
         name_no_ext = os.path.splitext(filename)[0]
         out_path = os.path.join(self.out_dir, f"{name_no_ext}.wav")
         
-        # Avoid overwriting directly if input and output are the same
+        # Avoid overwriting
         if os.path.abspath(self.input_path) == os.path.abspath(out_path):
             out_path = os.path.join(self.out_dir, f"{name_no_ext}_converted.wav")
 
-        # Set Codec for Bit Depth
-        codec = "pcm_s24le" # Default to 24-bit
-        if self.target_bd == "16-bit": codec = "pcm_s16le"
-        elif self.target_bd == "24-bit": codec = "pcm_s24le"
-        elif self.target_bd == "32-bit Float": codec = "pcm_f32le"
-        elif self.target_bd == "Original": codec = "copy" # Try to copy audio stream directly if no changes
-
-        cmd = [
-            FFMPEG_BIN, "-y", "-i", self.input_path,
-            "-map_metadata", "0", # Pristine metadata copy
-        ]
+        # 1. Determine Actual Target Parameters
+        actual_sr = self.original_data['sample_rate'] if self.target_sr == "Original" else int(self.target_sr)
         
-        if self.target_sr != "Original":
-            cmd.extend(["-ar", self.target_sr])
-            
-        if codec != "copy" or self.target_sr != "Original":
-            if codec == "copy": 
-                codec = "pcm_s24le" # Fallback if we must resample but BD was 'Original'
-            cmd.extend([
-                "-c:a", codec,
-                "-dither_method", "triangular" # High quality dither when downsampling bit depth
-            ])
-        else:
-            cmd.extend(["-c:a", "copy"])
+        channels = self.original_data['channels']
+        if channels < 1: channels = 2 # Safey fallback
 
-        cmd.append(out_path)
+        actual_bd_str = self.target_bd
+        if actual_bd_str == "Original":
+            detected_bd = self.original_data['bit_depth']
+            if detected_bd <= 16: actual_bd_str = "16-bit"
+            elif detected_bd == 32: actual_bd_str = "32-bit Float"
+            else: actual_bd_str = "24-bit"
 
-        # Hide console window on Windows
+        is_float = (actual_bd_str == "32-bit Float")
+
+        # Hide terminal window on Windows
         startupinfo = None
         if sys.platform == "win32":
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
         try:
-            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
-            if process.returncode == 0 and os.path.exists(out_path):
-                # Re-analyze the new file
+            # ----------------------------------------------------------------------------------
+            # METHOD A: Python `wave` module wrapper (Guarantees macOS Finder metadata visibility)
+            # ----------------------------------------------------------------------------------
+            if not is_float:
+                sampwidth = 2 if actual_bd_str == "16-bit" else 3
+                raw_fmt = "s16le" if sampwidth == 2 else "s24le"
+                raw_codec = "pcm_s16le" if sampwidth == 2 else "pcm_s24le"
+
+                # Instruct FFmpeg to output pure raw bytes with no headers to stdout
+                cmd = [
+                    FFMPEG_BIN, "-v", "error", "-y", "-i", self.input_path,
+                    "-map", "0:a:0",           # Audio only (no album art)
+                    "-ar", str(actual_sr),     # Resample
+                    "-ac", str(channels),      # Mixdown/Up channels
+                    "-f", raw_fmt,             # Raw output format
+                    "-c:a", raw_codec,         # Codec
+                    "-"                        # Pipe out
+                ]
+
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
+                
+                # Use python's wave module to write the most basic, vanilla header possible
+                with wave.open(out_path, 'wb') as wf:
+                    wf.setnchannels(channels)
+                    wf.setsampwidth(sampwidth)
+                    wf.setframerate(actual_sr)
+                    
+                    # Read the raw stream in chunks and package it into the WAV file
+                    while True:
+                        chunk = process.stdout.read(8192)
+                        if not chunk: break
+                        wf.writeframes(chunk)
+                
+                process.wait()
+                if process.returncode != 0:
+                    err_msg = process.stderr.read().decode()
+                    raise Exception(err_msg)
+
+            # ----------------------------------------------------------------------------------
+            # METHOD B: FFmpeg direct write (For 32-bit float only, since `wave` lacks float support)
+            # ----------------------------------------------------------------------------------
+            else:
+                cmd = [
+                    FFMPEG_BIN, "-y", "-i", self.input_path,
+                    "-map", "0:a:0",
+                    "-ar", str(actual_sr),
+                    "-c:a", "pcm_f32le",
+                    "-map_metadata", "-1",   # Strip metadata completely
+                    "-fflags", "+bitexact",  # Strip FFmpeg signature
+                    "-write_bext", "0",      # Remove Broadcast chunk
+                    "-write_id3v2", "0",     # Remove ID3 tags
+                    out_path
+                ]
+                process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
+                if process.returncode != 0:
+                    raise Exception(process.stderr.decode())
+
+            # Verification
+            if os.path.exists(out_path):
                 new_data = analyze_file(out_path)
                 self.signals.conversion_result.emit(self.row, "Converted", new_data)
             else:
-                self.signals.conversion_result.emit(self.row, "Error: FFmpeg Failed", analyze_file(self.input_path))
+                raise Exception("Output file was not created.")
+
         except Exception as e:
-            self.signals.conversion_result.emit(self.row, f"Error: {str(e)}", analyze_file(self.input_path))
+            if os.path.exists(out_path): os.remove(out_path) # Cleanup broken file
+            self.signals.conversion_result.emit(self.row, f"Error: {str(e)}", self.original_data)
+
 
 def analyze_file(path):
-    """Helper function to extract metadata"""
     file_size = os.path.getsize(path) if os.path.exists(path) else 0
     try:
         tag = TinyTag.get(path)
@@ -209,19 +257,16 @@ class ConvertDialog(QDialog):
         
         layout = QVBoxLayout(self)
         
-        # Sample Rate
         layout.addWidget(QLabel("Target Sample Rate:"))
         self.cb_sr = QComboBox()
         self.cb_sr.addItems(["Original", "44100", "48000", "88200", "96000", "192000"])
         layout.addWidget(self.cb_sr)
         
-        # Bit Depth
         layout.addWidget(QLabel("Target Bit Depth:"))
         self.cb_bd = QComboBox()
         self.cb_bd.addItems(["Original", "16-bit", "24-bit", "32-bit Float"])
         layout.addWidget(self.cb_bd)
         
-        # Output Folder
         layout.addWidget(QLabel("Output Folder:"))
         folder_layout = QHBoxLayout()
         self.le_folder = QLineEdit()
@@ -234,7 +279,6 @@ class ConvertDialog(QDialog):
         
         layout.addStretch()
         
-        # Buttons
         btn_layout = QHBoxLayout()
         btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.reject)
@@ -352,14 +396,12 @@ class MainWindow(QMainWindow):
         self.operations_total = 0
         self.operations_done = 0
 
-        # --- UI Construction ---
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # -- Sidebar --
         self.sidebar_frame = QFrame()
         self.sidebar_frame.setObjectName("Sidebar")
         self.sidebar_frame.setFixedWidth(280)
@@ -367,7 +409,6 @@ class MainWindow(QMainWindow):
         sidebar_layout.setContentsMargins(15, 20, 15, 20)
         sidebar_layout.setSpacing(10)
 
-        # Logo
         lbl_logo = QLabel()
         lbl_logo.setAlignment(Qt.AlignCenter)
         lbl_logo.setText("""
@@ -381,7 +422,6 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(lbl_logo)
         sidebar_layout.addSpacing(20)
 
-        # Actions
         sidebar_layout.addWidget(self.create_header_label("INPUT & ACTIONS"))
         
         btn_select = QPushButton("Select Files / Folder")
@@ -394,7 +434,6 @@ class MainWindow(QMainWindow):
         btn_clear.clicked.connect(self.clear_table)
         sidebar_layout.addWidget(btn_clear)
         
-        # Conversion Button
         self.btn_convert = QPushButton("Convert Selected")
         self.btn_convert.setObjectName("ActionBtn")
         self.btn_convert.setCursor(Qt.PointingHandCursor)
@@ -402,7 +441,6 @@ class MainWindow(QMainWindow):
         self.btn_convert.setEnabled(False)
         sidebar_layout.addWidget(self.btn_convert)
 
-        # Export Button
         self.btn_export = QPushButton("Export to CSV")
         self.btn_export.setCursor(Qt.PointingHandCursor)
         self.btn_export.clicked.connect(self.export_csv)
@@ -411,7 +449,6 @@ class MainWindow(QMainWindow):
 
         sidebar_layout.addSpacing(10)
 
-        # Stats
         sidebar_layout.addWidget(self.create_header_label("STATISTICS"))
         self.stats_frame = QFrame()
         self.stats_frame.setObjectName("StatsFrame")
@@ -428,7 +465,6 @@ class MainWindow(QMainWindow):
         
         sidebar_layout.addStretch()
 
-        # Status & Progress
         self.lbl_status = QLabel("Ready")
         self.lbl_status.setAlignment(Qt.AlignCenter)
         self.lbl_status.setStyleSheet("color: #888;") 
@@ -440,7 +476,6 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         sidebar_layout.addWidget(self.progress_bar)
 
-        # -- Main Table Area --
         table_frame = QFrame()
         table_layout = QVBoxLayout(table_frame)
         table_layout.setContentsMargins(0, 0, 0, 0)
@@ -492,7 +527,6 @@ class MainWindow(QMainWindow):
             QProgressBar::chunk { background-color: #58A39C; }
         """)
 
-    # --- Discovery Phase ---
     def select_input(self):
         dialog = QFileDialog(self, "Select audio files")
         dialog.setFileMode(QFileDialog.ExistingFiles)
@@ -544,7 +578,6 @@ class MainWindow(QMainWindow):
         worker.signals.analysis_finished.connect(self.on_analysis_finished)
         self.threadpool.start(worker)
 
-    # --- UI Updaters ---
     def update_row_data(self, row, data, status_text=None):
         status_str = status_text if status_text else data["status"]
         status_item = QTableWidgetItem(status_str)
@@ -570,7 +603,6 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, 7, NumberSortItem(format_size(data["size"]), data["size"]))
         self.table.setItem(row, 8, QTableWidgetItem(data["path"]))
         
-        # Don't double-count stats if we are just re-analyzing a converted file
         if status_str != "Converted":
             self.total_size_bytes += data["size"]
             self.total_duration_sec += data["duration"]
@@ -585,13 +617,11 @@ class MainWindow(QMainWindow):
         if self.table.rowCount() > 0:
             self.btn_export.setEnabled(True)
 
-    # --- Conversion Phase ---
     def on_selection_changed(self):
         has_selection = len(self.table.selectionModel().selectedRows()) > 0
         self.btn_convert.setEnabled(has_selection)
 
     def open_convert_dialog(self):
-        # Check if FFmpeg is available
         try:
             subprocess.run([FFMPEG_BIN, "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except Exception:
@@ -607,11 +637,9 @@ class MainWindow(QMainWindow):
         dialog = ConvertDialog(self)
         if dialog.exec():
             settings = dialog.get_settings()
-            
             if not settings["folder"]:
                 QMessageBox.warning(self, "Missing Output", "Please select an output folder.")
                 return
-
             self.start_conversion(rows, settings)
 
     def start_conversion(self, rows, settings):
@@ -625,6 +653,23 @@ class MainWindow(QMainWindow):
 
         for row in rows:
             input_path = self.table.item(row, 8).text()
+            
+            # Fetch original info to pass to the Worker
+            sr_text = self.table.item(row, 3).text().replace(" Hz", "")
+            orig_sr = int(sr_text) if sr_text.isdigit() else 44100
+            
+            bd_text = self.table.item(row, 4).text().replace("-bit", "")
+            orig_bd = int(bd_text) if bd_text.isdigit() else 24
+            
+            ch_text = self.table.item(row, 6).text()
+            orig_ch = int(ch_text) if ch_text.isdigit() else 2
+            
+            original_data = {
+                "sample_rate": orig_sr,
+                "bit_depth": orig_bd,
+                "channels": orig_ch
+            }
+
             self.table.setItem(row, 1, QTableWidgetItem("Converting..."))
             
             worker = ConversionWorker(
@@ -632,6 +677,7 @@ class MainWindow(QMainWindow):
                 input_path=input_path,
                 target_sr=settings["sr"],
                 target_bd=settings["bd"],
+                original_data=original_data,
                 out_dir=settings["folder"],
                 stop_func=lambda: self.stop_flag
             )
@@ -639,7 +685,6 @@ class MainWindow(QMainWindow):
             self.threadpool.start(worker)
 
     def on_conversion_result(self, row, status, data):
-        # Deduct old file size from stats before updating
         try:
             old_size = self.table.item(row, 7).value
             self.total_size_bytes -= old_size
@@ -658,7 +703,6 @@ class MainWindow(QMainWindow):
             self.progress_bar.setVisible(False)
             self.table.setSortingEnabled(True)
 
-    # --- Standard UI Actions ---
     def update_stats_ui(self):
         self.lbl_stat_files.setText(f"Total Files: {self.table.rowCount()}")
         self.lbl_stat_size.setText(f"Total Size: {format_size(self.total_size_bytes)}")
